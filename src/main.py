@@ -58,10 +58,17 @@ async def lifespan(app: FastAPI):
     # Initialize metrics
     init_metrics(app_settings.app_version)
     
-    # Initialize Facebook client (placeholder mode)
+    # Initialize Facebook client
+    # Parse page IDs from comma-separated string
+    page_ids = [p.strip() for p in app_settings.facebook_page_ids.split(",") if p.strip()]
+    
+    # Use real API if token is provided, otherwise mock
+    use_mock = app_settings.use_mock_apis or not app_settings.facebook_access_token
+    
     facebook_client = FacebookEventsClient(
-        use_mock=app_settings.use_mock_apis,
-        page_ids=[],  # Configure page IDs when using real API
+        access_token=app_settings.facebook_access_token,
+        page_ids=page_ids,
+        use_mock=use_mock,
     )
     
     # Initialize services
@@ -77,14 +84,16 @@ async def lifespan(app: FastAPI):
         logger.warning("kafka_producer_init_failed", error=str(e))
         event_producer = None
     
-    # Initialize and start poller (disabled by default for placeholder)
+    # Initialize and start poller (enabled when Facebook token is configured)
+    poller_enabled = bool(app_settings.facebook_access_token and page_ids)
     facebook_poller = FacebookPoller(
         facebook_client=facebook_client,
         event_producer=event_producer,
-        poll_interval_minutes=30,
-        enabled=False,  # Enable when Facebook API is configured
+        poll_interval_minutes=app_settings.facebook_poll_interval_minutes,
+        enabled=poller_enabled,
     )
-    # facebook_poller.start()  # Uncomment to enable polling
+    if poller_enabled:
+        facebook_poller.start()
     
     # Initialize pipeline consumer
     try:
