@@ -10,10 +10,19 @@ import aiohttp
 import structlog
 
 from cloudsound_shared.config.settings import app_settings
+from cloudsound_shared.jwt_handler import create_access_token
 from .event_parser import ParsedEvent
 from .enrichment_service import EnrichedEvent
 
 logger = structlog.get_logger(__name__)
+
+# Service account for internal API calls
+SERVICE_ACCOUNT = {
+    "user_id": "service:event-manager",
+    "email": "event-manager@cloudsound.internal",
+    "role": "admin",
+    "tenant_id": "default",
+}
 
 
 @dataclass
@@ -70,6 +79,15 @@ class LinkingService:
                 timeout=aiohttp.ClientTimeout(total=30)
             )
         return self._session
+    
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """Get authentication headers for service-to-service calls."""
+        token = create_access_token(SERVICE_ACCOUNT, expires_delta=timedelta(hours=1))
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-Tenant-ID": "default",
+        }
     
     async def close(self) -> None:
         """Close HTTP session."""
@@ -201,7 +219,8 @@ class LinkingService:
                 "date_to": (parsed.start_time + timedelta(days=1)).isoformat(),
             }
             
-            async with session.get(url, params=params) as response:
+            headers = self._get_auth_headers()
+            async with session.get(url, params=params, headers=headers) as response:
                 if response.status != 200:
                     return None
                 
@@ -241,22 +260,32 @@ class LinkingService:
         try:
             session = await self._get_session()
             
-            # Build concert data
+            # Build concert data - format for concert management API
+            location = parsed.venue_name or "Unknown Venue"
+            if parsed.city:
+                location = f"{location}, {parsed.city}"
+            
+            # Build description with music links and source info
+            description_parts = []
+            if parsed.name:
+                description_parts.append(parsed.name)
+            if parsed.description:
+                description_parts.append(parsed.description[:1500])  # Truncate to fit DB field
+            if parsed.music_links:
+                description_parts.append(f"\nMusic: {', '.join(parsed.music_links[:5])}")
+            description_parts.append(f"\nSource: {parsed.source_url}")
+            
             concert_data = {
-                "name": parsed.name,
-                "description": parsed.description,
                 "date": parsed.start_time.isoformat() if parsed.start_time else None,
-                "venue": parsed.venue_name,
-                "city": parsed.city,
-                "artists": parsed.artists,
-                "source": "facebook",
-                "source_id": parsed.source_id,
-                "source_url": parsed.source_url,
+                "location": location,
+                "description": "\n".join(description_parts)[:2000],  # DB limit
+                "facebook_event_id": parsed.source_id,
             }
             
             url = f"{self.concert_service_url}/api/v1/concerts"
+            headers = self._get_auth_headers()
             
-            async with session.post(url, json=concert_data) as response:
+            async with session.post(url, json=concert_data, headers=headers) as response:
                 if response.status in [200, 201]:
                     data = await response.json()
                     return data.get("id")
@@ -301,8 +330,9 @@ class LinkingService:
             }
             
             url = f"{self.concert_service_url}/api/v1/concerts/{concert_id}"
+            headers = self._get_auth_headers()
             
-            async with session.patch(url, json=update_data) as response:
+            async with session.patch(url, json=update_data, headers=headers) as response:
                 return response.status in [200, 204]
                 
         except Exception as e:
