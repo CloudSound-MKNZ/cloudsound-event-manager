@@ -6,7 +6,7 @@ including venue, artists, dates, and music links.
 import re
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import structlog
 
 from ..clients.facebook_client import FacebookEvent
@@ -277,8 +277,15 @@ class EventParser:
         if not parsed.start_time:
             errors.append("Missing start time")
         
-        if parsed.start_time and parsed.start_time < datetime.now():
-            errors.append("Event is in the past")
+        if parsed.start_time:
+            # Make comparison timezone-aware
+            now = datetime.now(timezone.utc)
+            event_time = parsed.start_time
+            # Convert to UTC if timezone-aware, or assume UTC if naive
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=timezone.utc)
+            if event_time < now:
+                errors.append("Event is in the past")
         
         if errors:
             parsed.is_valid = False
