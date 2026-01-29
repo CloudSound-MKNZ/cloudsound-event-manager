@@ -95,7 +95,7 @@ class FacebookEventsClient:
         api_version: str = "v24.0",
         circuit_breaker_threshold: int = 5,
         circuit_breaker_timeout: float = 60.0,
-        fetch_days_back: int = 30,
+        fetch_days_back: int = 180,  # Default to 6 months to sync past events
     ):
         """Initialize Facebook Events client.
 
@@ -106,7 +106,7 @@ class FacebookEventsClient:
             api_version: Facebook Graph API version (default v24.0)
             circuit_breaker_threshold: Failures before opening circuit
             circuit_breaker_timeout: Seconds before retry after circuit opens
-            fetch_days_back: Number of days back to fetch events (default 30 = 1 month)
+            fetch_days_back: Number of days back to fetch events (default 180 = 6 months)
         """
         self.access_token = access_token
         self.page_ids = page_ids or []
@@ -143,9 +143,7 @@ class FacebookEventsClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=30)
-            )
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self._session
 
     def _generate_mock_events(self, count: int = 5) -> List[FacebookEvent]:
@@ -171,12 +169,29 @@ class FacebookEventsClient:
         ]
 
         events = []
-        base_date = datetime.now() + timedelta(days=random.randint(1, 7))
+        # Generate events spanning both past and future to match fetch_days_back behavior
+        # Spread events from (fetch_days_back days ago) to (30 days in future)
+        days_back = getattr(self, "fetch_days_back", 180)
+        start_offset = -days_back  # Start from N days ago
+        end_offset = 30  # End 30 days in future
 
         for i in range(count):
             venue = random.choice(venues)
             band = random.choice(band_names)
-            event_date = base_date + timedelta(days=i * random.randint(2, 5))
+            # Distribute events evenly across the full range (past to future)
+            # This ensures we have events both in the past (for sync) and future (for upcoming)
+            if count > 1:
+                progress = i / (count - 1)  # 0.0 to 1.0
+                days_offset = int(start_offset + progress * (end_offset - start_offset))
+                # Add some randomness but keep within reasonable bounds
+                days_offset += random.randint(-3, 3)
+            else:
+                # Single event: place it somewhere in the middle of the range
+                # Ensure first arg <= second arg for random.randint
+                min_offset = min(start_offset // 2, end_offset // 2)
+                max_offset = max(start_offset // 2, end_offset // 2)
+                days_offset = random.randint(min_offset, max_offset)
+            event_date = datetime.now() + timedelta(days=days_offset)
 
             events.append(
                 FacebookEvent(
@@ -232,14 +247,74 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
             FacebookEventsResponse with events list
         """
         if self.use_mock:
+            import json
+            import os
+
             logger.debug("facebook_get_events_mock", page_id=page_id, limit=limit)
             await asyncio.sleep(0.1)  # Simulate API latency
 
             events = self._generate_mock_events(min(limit, 5))
 
+            # #region agent log
+            log_path = "/home/tef/Gits/Cloudsound-Workspace/CloudSound/.cursor/debug.log"
+            try:
+                with open(log_path, "a") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "sessionId": "debug-session",
+                                "runId": "run1",
+                                "hypothesisId": "E",
+                                "location": "facebook_client.py:245",
+                                "message": "mock events generated before filter",
+                                "data": {
+                                    "events_count": len(events),
+                                    "event_start_times": [
+                                        e.start_time.isoformat() if e.start_time else None
+                                        for e in events
+                                    ],
+                                    "since": since.isoformat() if since else None,
+                                },
+                                "timestamp": int(datetime.now().timestamp() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except:
+                pass
+            # #endregion agent log
+
             # Filter by date if provided
             if since:
                 events = [e for e in events if e.start_time and e.start_time >= since]
+
+                # #region agent log
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "E",
+                                    "location": "facebook_client.py:260",
+                                    "message": "mock events after since filter",
+                                    "data": {
+                                        "events_count": len(events),
+                                        "event_start_times": [
+                                            e.start_time.isoformat() if e.start_time else None
+                                            for e in events
+                                        ],
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
+
             if until:
                 events = [e for e in events if e.start_time and e.start_time <= until]
 
@@ -252,9 +327,7 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
         async def _fetch():
             target_page_id = page_id or (self.page_ids[0] if self.page_ids else None)
             if not target_page_id:
-                raise FacebookClientError(
-                    "No page_id provided and no page_ids configured"
-                )
+                raise FacebookClientError("No page_id provided and no page_ids configured")
 
             # Build request URL with fields we need
             fields = ",".join(
@@ -287,10 +360,14 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
 
             url = f"{self.base_url}/{target_page_id}/events"
 
-            logger.debug(
+            logger.info(
                 "facebook_api_request",
                 page_id=target_page_id,
                 url=url,
+                since=since.isoformat() if since else None,
+                until=until.isoformat() if until else None,
+                limit=limit,
+                params_count=len(params),
             )
 
             session = await self._get_session()
@@ -306,16 +383,43 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
                     if error_code in (190, 102):  # Token errors
                         raise FacebookAuthError(f"Authentication failed: {error_msg}")
                     elif error_code == 4:  # Rate limit
-                        raise FacebookRateLimitError(
-                            f"Rate limit exceeded: {error_msg}"
-                        )
+                        raise FacebookRateLimitError(f"Rate limit exceeded: {error_msg}")
                     else:
-                        raise FacebookClientError(
-                            f"API error ({error_code}): {error_msg}"
-                        )
+                        raise FacebookClientError(f"API error ({error_code}): {error_msg}")
 
                 # Parse events from response
                 events = []
+                raw_data_count = len(data.get("data", []))
+
+                # #region agent log
+                import json
+                import os
+
+                log_path = "/home/tef/Gits/Cloudsound-Workspace/CloudSound/.cursor/debug.log"
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "facebook_client.py:325",
+                                    "message": "facebook API response received",
+                                    "data": {
+                                        "page_id": target_page_id,
+                                        "raw_events_count": raw_data_count,
+                                        "has_error": "error" in data,
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
+
                 for event_data in data.get("data", []):
                     event = self._parse_event(event_data)
                     if event:
@@ -326,11 +430,40 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
                 next_cursor = paging.get("cursors", {}).get("after")
                 has_more = "next" in paging
 
+                # #region agent log
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "facebook_client.py:345",
+                                    "message": "events parsed from API",
+                                    "data": {
+                                        "page_id": target_page_id,
+                                        "parsed_events_count": len(events),
+                                        "raw_events_count": raw_data_count,
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
+
                 logger.info(
                     "facebook_api_response",
                     page_id=target_page_id,
                     event_count=len(events),
+                    raw_data_count=raw_data_count,
+                    parsed_count=len(events),
                     has_more=has_more,
+                    since=since.isoformat() if since else None,
+                    sample_event_ids=[e.event_id for e in events[:3]],
                 )
 
                 return FacebookEventsResponse(
@@ -350,17 +483,13 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
 
             if "start_time" in data:
                 try:
-                    start_time = datetime.fromisoformat(
-                        data["start_time"].replace("Z", "+00:00")
-                    )
+                    start_time = datetime.fromisoformat(data["start_time"].replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
 
             if "end_time" in data:
                 try:
-                    end_time = datetime.fromisoformat(
-                        data["end_time"].replace("Z", "+00:00")
-                    )
+                    end_time = datetime.fromisoformat(data["end_time"].replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
 
@@ -471,6 +600,9 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
         Returns:
             List of all events from all configured pages
         """
+        import json
+        import os
+
         all_events = []
 
         # Calculate the "since" date: fetch events from N days ago
@@ -479,8 +611,61 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
         if use_date_filter:
             since_date = datetime.now() - timedelta(days=self.fetch_days_back)
 
+        # #region agent log
+        log_path = "/home/tef/Gits/Cloudsound-Workspace/CloudSound/.cursor/debug.log"
+        try:
+            with open(log_path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "A",
+                            "location": "facebook_client.py:475",
+                            "message": "poll_all_pages entry",
+                            "data": {
+                                "fetch_days_back": self.fetch_days_back,
+                                "since_date": since_date.isoformat() if since_date else None,
+                                "page_ids": self.page_ids,
+                                "use_mock": self.use_mock,
+                                "use_date_filter": use_date_filter,
+                            },
+                            "timestamp": int(datetime.now().timestamp() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except:
+            pass
+        # #endregion agent log
+
         for page_id in self.page_ids or ["default"]:
             try:
+                # #region agent log
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "facebook_client.py:495",
+                                    "message": "calling get_events for page",
+                                    "data": {
+                                        "page_id": page_id,
+                                        "since_date": since_date.isoformat(),
+                                        "limit": 100,
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
+
                 # Fetch events with optional date filtering
                 # For manual polls, fetch all events to ensure nothing is missed
                 response = await self.get_events(
@@ -488,6 +673,35 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
                     since=since_date,
                     limit=100,  # Increase limit to get more events
                 )
+
+                # #region agent log
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "facebook_client.py:510",
+                                    "message": "get_events response received",
+                                    "data": {
+                                        "page_id": page_id,
+                                        "events_count": len(response.events),
+                                        "event_ids": [e.event_id for e in response.events[:3]],
+                                        "event_start_times": [
+                                            e.start_time.isoformat() if e.start_time else None
+                                            for e in response.events[:3]
+                                        ],
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
 
                 all_events.extend(response.events)
                 self._last_poll[page_id] = datetime.now()
@@ -502,11 +716,58 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
                 )
 
             except Exception as e:
+                # #region agent log
+                try:
+                    with open(log_path, "a") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "debug-session",
+                                    "runId": "run1",
+                                    "hypothesisId": "B",
+                                    "location": "facebook_client.py:535",
+                                    "message": "get_events exception",
+                                    "data": {
+                                        "page_id": page_id,
+                                        "error": str(e),
+                                    },
+                                    "timestamp": int(datetime.now().timestamp() * 1000),
+                                }
+                            )
+                            + "\n"
+                        )
+                except:
+                    pass
+                # #endregion agent log
+
                 logger.error(
                     "facebook_page_poll_failed",
                     page_id=page_id,
                     error=str(e),
                 )
+
+        # #region agent log
+        try:
+            with open(log_path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "A",
+                            "location": "facebook_client.py:550",
+                            "message": "poll_all_pages returning",
+                            "data": {
+                                "total_events": len(all_events),
+                            },
+                            "timestamp": int(datetime.now().timestamp() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except:
+            pass
+        # #endregion agent log
 
         return all_events
 
@@ -559,9 +820,7 @@ Bandcamp: https://{band.lower().replace(" ", "")}.bandcamp.com/album/live
                     # if generated from a long-lived user token
                     return {
                         "valid": True,
-                        "token_type": "Page Access Token"
-                        if "id" in data
-                        else "User Access Token",
+                        "token_type": "Page Access Token" if "id" in data else "User Access Token",
                         "page_id": data.get("id"),
                         "page_name": data.get("name"),
                         "note": "Page Access Tokens from long-lived user tokens don't expire. "
