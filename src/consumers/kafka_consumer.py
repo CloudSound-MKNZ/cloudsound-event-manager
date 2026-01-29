@@ -20,7 +20,7 @@ from ..clients.facebook_client import FacebookEvent
 logger = structlog.get_logger(__name__)
 
 # Topics
-RAW_EVENTS_TOPIC = "facebook.events.raw"
+RAW_EVENTS_TOPIC = "raw-events"
 PROCESSED_EVENTS_TOPIC = "facebook.events.processed"
 
 
