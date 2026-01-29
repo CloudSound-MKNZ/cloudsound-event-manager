@@ -225,9 +225,12 @@ async def trigger_poll() -> PollResponse:
     """Trigger an immediate Facebook poll.
 
     Fetches events from configured Facebook pages and returns them.
-    In mock mode, returns sample events.
+    For manual polls, fetches ALL available events (no date filtering)
+    to ensure nothing is missed. In mock mode, returns sample events.
     """
-    events = await facebook_client.poll_all_pages()
+    # Use use_date_filter=False for manual polls to get all events
+    # This ensures users can sync all available events, not just recent ones
+    events = await facebook_client.poll_all_pages(use_date_filter=False)
 
     return PollResponse(
         events_fetched=len(events),
